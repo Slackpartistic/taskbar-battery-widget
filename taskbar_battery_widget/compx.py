@@ -127,7 +127,10 @@ class _Listener:
                         continue
                     pct = parse_power_report(r)
                     if pct is not None:
+                        changed = pct != self.pct
                         self.pct, self.updated = pct, time.time()
+                        if changed:
+                            _notify()
         except Exception:
             log.debug("compx listener stopped", exc_info=True)
         finally:
@@ -136,6 +139,30 @@ class _Listener:
 
 _listeners: dict[str, _Listener] = {}
 _listeners_lock = threading.Lock()
+_callbacks: list = []                   # called (from a listener thread) when a level changes
+
+
+def add_change_callback(cb) -> None:
+    """Call `cb()` whenever a keyboard pushes a new level (so the UI can rescan right away)."""
+    with _listeners_lock:
+        if cb not in _callbacks:
+            _callbacks.append(cb)
+
+
+def remove_change_callback(cb) -> None:
+    with _listeners_lock:
+        if cb in _callbacks:
+            _callbacks.remove(cb)
+
+
+def _notify() -> None:
+    with _listeners_lock:
+        cbs = list(_callbacks)
+    for cb in cbs:
+        try:
+            cb()
+        except Exception:
+            log.debug("compx change callback failed", exc_info=True)
 
 
 def _listener_for(path: str, handle_factory) -> _Listener | None:

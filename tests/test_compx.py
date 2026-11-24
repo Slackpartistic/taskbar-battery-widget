@@ -223,3 +223,34 @@ def test_two_receivers_get_distinct_ids():
         time.sleep(0.01)
     assert [d.battery for d in out] == [50, 60]
     assert out[0].id == "compx:fa09" and out[1].id.startswith("compx:fa09:")
+
+
+def test_change_callback_fires_only_when_the_level_changes():
+    calls = []
+    cb = lambda: calls.append(1)  # noqa: E731
+    compx.add_change_callback(cb)
+    compx.add_change_callback(cb)               # registering twice is a no-op
+    try:
+        h = FakeHandle([push(88, 0x11), push(88, 0x10), push(88), push(90)])
+        scan_until(h, lambda o: o and o[0].battery == 90)
+        assert wait_for(lambda: len(calls) == 2)
+        time.sleep(0.05)
+        assert len(calls) == 2                  # 88 once, 90 once; repeats of 88 are ignored
+    finally:
+        compx.remove_change_callback(cb)
+    compx.remove_change_callback(cb)            # removing twice is harmless
+    assert compx._callbacks == []
+
+
+def test_failing_callback_does_not_kill_the_listener():
+    def bad():
+        raise RuntimeError("x")
+    compx.add_change_callback(bad)
+    try:
+        h = FakeHandle([push(50)])
+        scan_until(h, lambda o: o and o[0].battery == 50)
+        h.queue.append(push(49))
+        out = scan_until(h, lambda o: o and o[0].battery == 49)
+        assert out[0].battery == 49
+    finally:
+        compx.remove_change_callback(bad)
