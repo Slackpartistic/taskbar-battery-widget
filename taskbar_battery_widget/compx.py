@@ -6,8 +6,8 @@ enumerates as product ``"2.4G Wireless Receiver"``. Its control collection is ve
 
 The keyboard cannot be asked for its battery level through this receiver (the receiver rejects
 every report id but ``0x13``, which also carries lighting commands, so nothing is ever written).
-Instead it *pushes* a status report whenever its power state changes: when Fn+B shows the level on
-the keys, and when the charging cable is plugged in or out::
+Instead it *pushes* a status report whenever its power state changes: when its level changes and when
+the charging cable is plugged in or out::
 
     13 0A 01 00 04 05 <pct> <flags> 00 .. 00 <sum>
 
@@ -15,17 +15,22 @@ the keys, and when the charging cable is plugged in or out::
 meaning of ``flags`` is not known yet (0x11 / 0x10 / 0x01 were seen), so charging is not reported.
 
 Because the reports are rare, one background thread per receiver keeps the collection open and
-remembers the last level; ``read()`` only reports it and never touches the device. The keyboard is
-listed once its receiver is open; until the first push it has no level of its own (press Fn+B once,
-or the widget's cache / last-known value fills in).
+remembers the last level; ``read()`` only reports it and never touches the device. The keyboard also
+pushes whenever its level changes by a percent. The last level is saved (``compx_last.json`` in the
+app data folder, keyed by a hash of the receiver path) and shown after a restart for up to 24 hours
+until the keyboard pushes a fresh one; plugging the cable in or out forces a fresh push.
 
 Format learned from a read-only capture on a real AULA F75 receiver; independent implementation.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
+import tempfile
 import threading
 import time
+from pathlib import Path
 
 from .hid_win import _is_bluetooth_path, path_hash
 from .models import Device
@@ -44,6 +49,9 @@ REPORT_ID = 0x13
 POWER_HEADER = bytes((0x13, 0x0A, 0x01, 0x00, 0x04, 0x05))
 
 DEFAULT_NAME = "2.4 GHz keyboard"
+REMEMBER_S = 24 * 3600.0    # a level saved by an earlier run is shown for at most this long
+STORE_NAME = "compx_last.json"
+STORE_PATH: Path | None = None  # tests override; default is the app data folder
 LISTEN_POLL_MS = 1000       # how often a listener checks its stop flag
 RETRY_DELAY_S = 5.0         # pause before a failed listener may be started again
 
@@ -97,8 +105,9 @@ class _ListenOnly:
 class _Listener:
     """Keeps one receiver collection open and remembers the last pushed level."""
 
-    def __init__(self, path: str, handle_factory):
+    def __init__(self, path: str, handle_factory, key: str = ""):
         self.path = path
+        self.key = key
         self._factory = handle_factory
         self._stop = threading.Event()
         self.opened = False                   # the collection could be opened for reading
@@ -130,6 +139,7 @@ class _Listener:
                         changed = pct != self.pct
                         self.pct, self.updated = pct, time.time()
                         if changed:
+                            _remember(self.key, pct, self.updated)
                             _notify()
         except Exception:
             log.debug("compx listener stopped", exc_info=True)
@@ -165,7 +175,65 @@ def _notify() -> None:
             log.debug("compx change callback failed", exc_info=True)
 
 
-def _listener_for(path: str, handle_factory) -> _Listener | None:
+def _store_path() -> Path:
+    if STORE_PATH is not None:
+        return Path(STORE_PATH)
+    from .device_history import base_dir
+    return base_dir() / STORE_NAME
+
+
+_store: dict | None = None
+_store_lock = threading.Lock()
+
+
+def _load_store() -> dict:
+    global _store
+    if _store is None:
+        data = {}
+        try:
+            raw = json.loads(_store_path().read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                for k, v in raw.items():
+                    if isinstance(k, str) and isinstance(v, list) and len(v) == 2 \
+                            and isinstance(v[0], int) and 1 <= v[0] <= 100 \
+                            and isinstance(v[1], (int, float)):
+                        data[k] = [int(v[0]), float(v[1])]
+        except Exception:
+            pass
+        _store = data
+    return _store
+
+
+def _remember(key: str, pct: int, ts: float) -> None:
+    """Save the last pushed level so the next start shows it before the keyboard pushes again."""
+    if not key:
+        return
+    try:
+        with _store_lock:
+            store = _load_store()
+            store[key] = [int(pct), float(ts)]
+            path = _store_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".compx", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(store, f)
+            os.replace(tmp, path)
+    except Exception:
+        log.debug("compx: saving the last level failed", exc_info=True)
+
+
+def _recall(key: str) -> tuple[int, float] | None:
+    try:
+        with _store_lock:
+            v = _load_store().get(key)
+        if v and 0 <= time.time() - v[1] <= REMEMBER_S:
+            return v[0], v[1]
+    except Exception:
+        pass
+    return None
+
+
+def _listener_for(path: str, handle_factory, key: str = "") -> _Listener | None:
     """Running listener for `path`, starting one if needed (not right after a failure)."""
     with _listeners_lock:
         cur = _listeners.get(path)
@@ -174,9 +242,13 @@ def _listener_for(path: str, handle_factory) -> _Listener | None:
         if cur is not None and cur.failed_at is not None \
                 and time.monotonic() - cur.failed_at < RETRY_DELAY_S:
             return cur
-        new = _Listener(path, handle_factory)
+        new = _Listener(path, handle_factory, key)
         if cur is not None:             # a restarted listener keeps the last known level
             new.pct, new.updated = cur.pct, cur.updated
+        else:                           # first start: the level saved by an earlier run
+            old = _recall(key)
+            if old is not None:
+                new.pct, new.updated = old
         _listeners[path] = new
         new.start()
         return new
@@ -212,7 +284,7 @@ def read(infos, deadline: float, cancel: threading.Event | None = None,
             if phash in done:
                 continue
             done.add(phash)
-            lst = _listener_for(i.path, handle_factory)
+            lst = _listener_for(i.path, handle_factory, f"{i.pid:04x}:{phash}")
             if lst is None or not (lst.opened or lst.pct is not None):
                 continue                # not open yet (next scan) or the collection is unusable
             pct = lst.pct

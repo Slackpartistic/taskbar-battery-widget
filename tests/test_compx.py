@@ -60,8 +60,10 @@ class FakeHandle:
 
 
 @pytest.fixture(autouse=True)
-def _clean():
+def _clean(tmp_path, monkeypatch):
     compx.stop_all()
+    monkeypatch.setattr(compx, "STORE_PATH", tmp_path / "compx_last.json")
+    monkeypatch.setattr(compx, "_store", None)
     yield
     compx.stop_all()
 
@@ -254,3 +256,50 @@ def test_failing_callback_does_not_kill_the_listener():
         assert out[0].battery == 49
     finally:
         compx.remove_change_callback(bad)
+
+
+def _restart_app():
+    """Simulate a new run: no listeners, store re-read from disk."""
+    compx.stop_all()
+    compx._store = None
+
+
+def test_level_survives_an_app_restart():
+    h = FakeHandle([push(83)])
+    scan_until(h, lambda o: o and o[0].battery == 83)
+    assert wait_for(compx.STORE_PATH.exists)
+    _restart_app()
+    out = scan_until(FakeHandle(), lambda o: bool(o))
+    assert out[0].battery == 83 and out[0].connected and out[0].updated is not None
+
+
+def test_fresh_push_replaces_the_remembered_level():
+    scan_until(FakeHandle([push(83)]), lambda o: o and o[0].battery == 83)
+    assert wait_for(compx.STORE_PATH.exists)
+    _restart_app()
+    h = FakeHandle()
+    scan_until(h, lambda o: o and o[0].battery == 83)
+    h.queue.append(push(100))
+    assert scan_until(h, lambda o: o and o[0].battery == 100)[0].battery == 100
+
+
+def test_old_or_corrupt_saved_level_is_ignored(monkeypatch):
+    key = f"fa09:{hid_win.path_hash(f75_info().path)}"
+    compx.STORE_PATH.write_text('{"%s": [70, %f]}' % (key, time.time() - compx.REMEMBER_S - 60))
+    out = scan_until(FakeHandle(), lambda o: bool(o))
+    assert out[0].battery is None
+    _restart_app()
+    compx.STORE_PATH.write_text("not json")
+    out = scan_until(FakeHandle(), lambda o: bool(o))
+    assert out[0].battery is None
+    _restart_app()
+    compx.STORE_PATH.write_text('{"%s": [300, %f]}' % (key, time.time()))
+    assert scan_until(FakeHandle(), lambda o: bool(o))[0].battery is None
+
+
+def test_unwritable_store_does_not_break_reading(monkeypatch, tmp_path):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    monkeypatch.setattr(compx, "STORE_PATH", blocker / "sub" / "compx_last.json")
+    out = scan_until(FakeHandle([push(61)]), lambda o: o and o[0].battery == 61)
+    assert out[0].battery == 61
