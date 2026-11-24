@@ -120,7 +120,7 @@ def test_xinput_never_idle_cached(monkeypatch):
     ("logi:0af7", "046d:0af7"), ("logi:c539:01", "046d:c539"),
     ("hyperx:16c4", "0951:16c4"), ("hyperx:1723", "0951:1723"), ("hyperx:1718", "0951:1718"),
     ("hyperx:0696", "03f0:0696"), ("hyperx:018b", "03f0:018b"), ("hyperx:098d", "03f0:098d"),
-    ("hyperx:08be", "03f0:08be"),
+    ("hyperx:08be", "03f0:08be"), ("hyperx:0ac1", "03f0:0ac1"),
     ("lenovo:a07d", "17ef:a07d"), ("mchose:6045", "3837:6045"), ("mchose:385d", "291d:385d"),
     ("razer:0555", "1532:0555"), ("razer:0565", "1532:0565"), ("razer:1390", "1532:0565"),
     ("aula:024f", "05ac:024f"), ("aula:024f:a1b2c3", "05ac:024f"),
