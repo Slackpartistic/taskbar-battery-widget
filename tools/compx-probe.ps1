@@ -109,7 +109,7 @@ public static class CompxProbe
         h.Dispose();
     }
 
-    public static int ListenSeconds = 25;
+    public static int ListenSeconds = 180;
 
     static void Listen(string path, int inLen)
     {
@@ -119,7 +119,7 @@ public static class CompxProbe
         bool gok = HidD_GetInputReport(h, gi, gi.Length);
         W("  GetInputReport(0x13): " + (gok ? Hex(gi, gi.Length) : "failed, error " + Marshal.GetLastWin32Error()));
         Console.WriteLine();
-        Console.WriteLine("  LISTENING " + ListenSeconds + "s: press Fn+B a few times, then plug in and unplug the keyboard's USB-C charging cable.");
+        Console.WriteLine("  LISTENING " + ListenSeconds + "s. 1) Do not touch the keyboard for 90 s (let it sleep). 2) Press one key to wake it. 3) Switch the keyboard OFF, wait 10 s, switch it back ON.");
         using (FileStream fs = new FileStream(h, FileAccess.Read, inLen, true))
         {
             DateTime start = DateTime.UtcNow;
