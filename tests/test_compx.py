@@ -305,15 +305,11 @@ def test_unwritable_store_does_not_break_reading(monkeypatch, tmp_path):
     assert out[0].battery == 61
 
 
-def test_level_without_a_push_for_an_hour_is_shown_as_asleep():
+def test_old_saved_level_is_shown_live_at_start_up():
     key = f"fa09:{hid_win.path_hash(f75_info().path)}"
-    compx.STORE_PATH.write_text('{"%s": [70, %f]}' % (key, time.time() - compx.IDLE_AFTER_S - 60))
-    h = FakeHandle()
-    out = scan_until(h, lambda o: bool(o))
-    assert out[0].battery == 70 and out[0].idle
-    h.queue.append(push(69))
-    out = scan_until(h, lambda o: o and o[0].battery == 69)
-    assert not out[0].idle
+    compx.STORE_PATH.write_text('{"%s": [70, %f]}' % (key, time.time() - 6 * 3600))
+    out = scan_until(FakeHandle(), lambda o: bool(o))
+    assert out[0].battery == 70 and out[0].connected and not out[0].idle
 
 
 def state(awake: bool) -> bytes:
@@ -343,32 +339,37 @@ def test_sleep_and_wake_follow_the_keyboard():
     try:
         h = FakeHandle([push(86)])
         scan_until(h, lambda o: o and o[0].battery == 86)
-        assert not scan(h)[0].idle
+        assert scan(h)[0].connected
         n = len(calls)
         h.queue.append(state(False))
-        out = scan_until(h, lambda o: o and o[0].idle)
-        assert out[0].battery == 86 and out[0].idle
+        out = scan_until(h, lambda o: o and not o[0].connected)
+        assert out[0].battery == 86 and not out[0].connected and not out[0].idle
         assert len(calls) > n                       # sleeping refreshes the widget right away
         h.queue.append(state(True))
-        out = scan_until(h, lambda o: o and not o[0].idle)
-        assert out[0].battery == 86 and not out[0].idle
+        out = scan_until(h, lambda o: o and o[0].connected)
+        assert out[0].battery == 86 and out[0].connected
     finally:
         compx.remove_change_callback(cb)
 
 
 def test_power_on_report_marks_awake():
     h = FakeHandle([push(86), state(False)])
-    scan_until(h, lambda o: o and o[0].idle)
+    scan_until(h, lambda o: o and not o[0].connected)
     h.queue.extend([state(True), bytes.fromhex("130A010004070000000000000000000000000029"), push(85)])
-    out = scan_until(h, lambda o: o and o[0].battery == 85 and not o[0].idle)
-    assert out[0].battery == 85 and not out[0].idle
+    out = scan_until(h, lambda o: o and o[0].battery == 85 and o[0].connected)
+    assert out[0].battery == 85 and out[0].connected
 
 
-def test_known_awake_state_overrides_the_one_hour_guess():
-    key = f"fa09:{hid_win.path_hash(f75_info().path)}"
-    compx.STORE_PATH.write_text('{"%s": [70, %f]}' % (key, time.time() - compx.IDLE_AFTER_S - 60))
-    h = FakeHandle()
-    assert scan_until(h, lambda o: bool(o))[0].idle
-    h.queue.append(state(True))
-    out = scan_until(h, lambda o: o and not o[0].idle)
-    assert out[0].battery == 70 and not out[0].idle
+def test_level_push_alone_reconnects():
+    h = FakeHandle([push(86), state(False)])
+    scan_until(h, lambda o: o and not o[0].connected)
+    h.queue.append(push(85))
+    out = scan_until(h, lambda o: o and o[0].connected)
+    assert out[0].battery == 85
+
+
+def test_asleep_as_moon_when_configured(monkeypatch):
+    monkeypatch.setattr(compx, "ASLEEP_AS_DISCONNECTED", False)
+    h = FakeHandle([push(86), state(False)])
+    out = scan_until(h, lambda o: o and o[0].idle)
+    assert out[0].connected and out[0].idle and out[0].battery == 86
