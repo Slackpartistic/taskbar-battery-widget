@@ -330,7 +330,7 @@ features *Unified Battery* (0x1004), *Battery Status* (0x1000), *Battery Voltage
 | --- | --- |
 | AULA F108 Pro — 2.4 GHz dongle (`05AC:024F`, `"F108Pro Dongle"`, battery %) | ✅ |
 | AULA F108 Pro — USB cable (`0C45:800A`, firmware reports no battery %) | ❌ |
-| AULA F75 and other keyboards on a Compx "2.4G Wireless Receiver" (`3554:FA09`, battery % and charging) | 🟢 |
+| AULA F75 and other keyboards on a Compx "2.4G Wireless Receiver" (`3554:FA09`, battery % only; the keyboard sends it when you press Fn+B or plug/unplug the cable) | 🟡 |
 ### 8BitDo (2DC8)
 | Device | Status |
 | --- | --- |
