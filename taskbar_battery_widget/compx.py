@@ -16,12 +16,13 @@ meaning of ``flags`` is not known yet (0x11 / 0x10 / 0x01 were seen), so chargin
 
 It also reports sleep and wake: ``13 0A 01 00 04 02 <state> 00 .. <sum>`` with state 0 when it
 falls asleep or leaves 2.4 GHz mode and 1 when it wakes or returns to 2.4 GHz (returning is followed by
-a power report). The two "off" cases cannot be told apart, so both show the last value as asleep.
+a power report). The two "off" cases cannot be told apart, so both show the keyboard as disconnected with its
+last value; it counts as connected again on the next wake or level report.
 
 Because the reports are rare, one background thread per receiver keeps the collection open and
 remembers the last level; ``read()`` only reports it and never touches the device. The keyboard also
 pushes whenever its level changes by a percent. The last level is saved (``compx_last.json`` in the
-app data folder, keyed by a hash of the receiver path) and shown after a restart for up to 24 hours
+app data folder, keyed by a hash of the receiver path) and shown after a restart for up to 7 days
 until the keyboard pushes a fresh one; plugging the cable in or out forces a fresh push.
 
 Format learned from a read-only capture on a real AULA F75 receiver; independent implementation.
@@ -54,8 +55,10 @@ POWER_HEADER = bytes((0x13, 0x0A, 0x01, 0x00, 0x04, 0x05))
 STATE_HEADER = bytes((0x13, 0x0A, 0x01, 0x00, 0x04, 0x02))
 
 DEFAULT_NAME = "2.4 GHz keyboard"
-IDLE_AFTER_S = 3600.0       # sleep state unknown and no push for this long: show as asleep
-REMEMBER_S = 24 * 3600.0    # a level saved by an earlier run is shown for at most this long
+REMEMBER_S = 7 * 86400.0    # a level saved by an earlier run is shown for at most this long
+# The keyboard sends the same report when it falls asleep and when it leaves 2.4 GHz mode, so
+# both are shown as disconnected (last value, dimmed) until it wakes or pushes a level again.
+ASLEEP_AS_DISCONNECTED = True
 STORE_NAME = "compx_last.json"
 STORE_PATH: Path | None = None  # tests override; default is the app data folder
 LISTEN_POLL_MS = 1000       # how often a listener checks its stop flag
@@ -320,15 +323,13 @@ def read(infos, deadline: float, cancel: threading.Event | None = None,
                 kind="keyboard",
                 battery=pct,
                 charging=False,
-                connected=True,
+                connected=lst.awake is not False or not ASLEEP_AS_DISCONNECTED,
                 link="2.4ghz",
                 source="hid",
                 updated=lst.updated if pct is not None else None,
-                # Asleep or off the receiver (the keyboard says so) -> last value. Before its first
-                # sleep/wake report, a level unchanged for an hour is treated the same way.
-                idle=pct is not None and (lst.awake is False or (
-                    lst.awake is None and lst.updated is not None
-                    and time.time() - lst.updated > IDLE_AFTER_S)),
+                # Until the keyboard says otherwise it is taken as awake, so the saved level
+                # shows as live right after start-up instead of waiting for the next push.
+                idle=pct is not None and lst.awake is False and not ASLEEP_AS_DISCONNECTED,
             )
             nth = rank.get(dev.id, 0)
             rank[dev.id] = nth + 1
