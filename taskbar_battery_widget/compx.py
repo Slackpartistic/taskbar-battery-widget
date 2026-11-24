@@ -14,6 +14,10 @@ the charging cable is plugged in or out::
 ``pct`` (index 6) is the level 1..100 and ``sum`` (index 19) is the 8-bit sum of bytes 0..18. The
 meaning of ``flags`` is not known yet (0x11 / 0x10 / 0x01 were seen), so charging is not reported.
 
+It also reports sleep and wake: ``13 0A 01 00 04 02 <state> 00 .. <sum>`` with state 0 when it
+falls asleep or leaves 2.4 GHz mode and 1 when it wakes or returns to 2.4 GHz (returning is followed by
+a power report). The two "off" cases cannot be told apart, so both show the last value as asleep.
+
 Because the reports are rare, one background thread per receiver keeps the collection open and
 remembers the last level; ``read()`` only reports it and never touches the device. The keyboard also
 pushes whenever its level changes by a percent. The last level is saved (``compx_last.json`` in the
@@ -47,9 +51,10 @@ CONTROL_USAGE = 0x0002
 REPORT_LEN = 20             # Win32 report length, report id included
 REPORT_ID = 0x13
 POWER_HEADER = bytes((0x13, 0x0A, 0x01, 0x00, 0x04, 0x05))
+STATE_HEADER = bytes((0x13, 0x0A, 0x01, 0x00, 0x04, 0x02))
 
 DEFAULT_NAME = "2.4 GHz keyboard"
-IDLE_AFTER_S = 3600.0       # no push for this long: show the level as asleep / last value
+IDLE_AFTER_S = 3600.0       # sleep state unknown and no push for this long: show as asleep
 REMEMBER_S = 24 * 3600.0    # a level saved by an earlier run is shown for at most this long
 STORE_NAME = "compx_last.json"
 STORE_PATH: Path | None = None  # tests override; default is the app data folder
@@ -57,14 +62,27 @@ LISTEN_POLL_MS = 1000       # how often a listener checks its stop flag
 RETRY_DELAY_S = 5.0         # pause before a failed listener may be started again
 
 
-def parse_power_report(buf: bytes | None) -> int | None:
-    """Battery percent from a pushed ``13 0A 01 00 04 05`` report, else None."""
+def _frame(buf: bytes | None, header: bytes) -> bytes | None:
     if not buf or len(buf) < REPORT_LEN:
         return None
     b = bytes(buf[:REPORT_LEN])
-    if b[:len(POWER_HEADER)] != POWER_HEADER:
+    if b[:len(header)] != header or sum(b[:REPORT_LEN - 1]) & 0xFF != b[REPORT_LEN - 1]:
         return None
-    if sum(b[:REPORT_LEN - 1]) & 0xFF != b[REPORT_LEN - 1]:
+    return b
+
+
+def parse_state_report(buf: bytes | None) -> bool | None:
+    """True (awake) / False (asleep or off the receiver) from a ``13 0A 01 00 04 02`` report."""
+    b = _frame(buf, STATE_HEADER)
+    if b is None or b[6] not in (0, 1) or any(b[7:REPORT_LEN - 1]):
+        return None
+    return b[6] == 1
+
+
+def parse_power_report(buf: bytes | None) -> int | None:
+    """Battery percent from a pushed ``13 0A 01 00 04 05`` report, else None."""
+    b = _frame(buf, POWER_HEADER)
+    if b is None:
         return None
     pct = b[6]
     if not 1 <= pct <= 100:
@@ -113,6 +131,7 @@ class _Listener:
         self._stop = threading.Event()
         self.opened = False                   # the collection could be opened for reading
         self.pct: int | None = None
+        self.awake: bool | None = None        # None until the keyboard reports sleep / wake
         self.updated: float | None = None     # epoch seconds of the last push
         self.failed_at: float | None = None   # monotonic time the listener died
         self._thread = threading.Thread(target=self._run, name="compx-listener", daemon=True)
@@ -135,10 +154,16 @@ class _Listener:
                     r = h.read(timeout_ms=LISTEN_POLL_MS)
                     if r is None:
                         continue
+                    awake = parse_state_report(r)
+                    if awake is not None:
+                        if awake != self.awake:
+                            self.awake = awake
+                            _notify()
+                        continue
                     pct = parse_power_report(r)
                     if pct is not None:
-                        changed = pct != self.pct
-                        self.pct, self.updated = pct, time.time()
+                        changed = pct != self.pct or self.awake is not True
+                        self.pct, self.updated, self.awake = pct, time.time(), True
                         if changed:
                             _remember(self.key, pct, self.updated)
                             _notify()
@@ -299,10 +324,11 @@ def read(infos, deadline: float, cancel: threading.Event | None = None,
                 link="2.4ghz",
                 source="hid",
                 updated=lst.updated if pct is not None else None,
-                # The receiver cannot tell whether the keyboard is on; a level that has not
-                # changed for an hour is shown as asleep (last value) rather than live.
-                idle=pct is not None and lst.updated is not None
-                and time.time() - lst.updated > IDLE_AFTER_S,
+                # Asleep or off the receiver (the keyboard says so) -> last value. Before its first
+                # sleep/wake report, a level unchanged for an hour is treated the same way.
+                idle=pct is not None and (lst.awake is False or (
+                    lst.awake is None and lst.updated is not None
+                    and time.time() - lst.updated > IDLE_AFTER_S)),
             )
             nth = rank.get(dev.id, 0)
             rank[dev.id] = nth + 1

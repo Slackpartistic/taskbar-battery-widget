@@ -314,3 +314,61 @@ def test_level_without_a_push_for_an_hour_is_shown_as_asleep():
     h.queue.append(push(69))
     out = scan_until(h, lambda o: o and o[0].battery == 69)
     assert not out[0].idle
+
+
+def state(awake: bool) -> bytes:
+    b = bytearray(20)
+    b[:6] = compx.STATE_HEADER
+    b[6] = 1 if awake else 0
+    b[19] = sum(b[:19]) & 0xFF
+    return bytes(b)
+
+
+@pytest.mark.parametrize("hexs,want", [
+    ("130A010004020000000000000000000000000024", False),   # fell asleep / left 2.4 GHz mode
+    ("130A010004020100000000000000000000000025", True),    # woke / back on 2.4 GHz
+    ("130A010004070000000000000000000000000029", None),    # unknown type 0x07
+    ("130A010004020200000000000000000000000026", None),    # unknown state value
+    ("130A010004020000000000000000000000000025", None),    # bad checksum
+])
+def test_captured_state_reports(hexs, want):
+    assert compx.parse_state_report(bytes.fromhex(hexs)) is want
+    assert compx.parse_power_report(bytes.fromhex(hexs)) is None
+
+
+def test_sleep_and_wake_follow_the_keyboard():
+    calls = []
+    cb = lambda: calls.append(1)  # noqa: E731
+    compx.add_change_callback(cb)
+    try:
+        h = FakeHandle([push(86)])
+        scan_until(h, lambda o: o and o[0].battery == 86)
+        assert not scan(h)[0].idle
+        n = len(calls)
+        h.queue.append(state(False))
+        out = scan_until(h, lambda o: o and o[0].idle)
+        assert out[0].battery == 86 and out[0].idle
+        assert len(calls) > n                       # sleeping refreshes the widget right away
+        h.queue.append(state(True))
+        out = scan_until(h, lambda o: o and not o[0].idle)
+        assert out[0].battery == 86 and not out[0].idle
+    finally:
+        compx.remove_change_callback(cb)
+
+
+def test_power_on_report_marks_awake():
+    h = FakeHandle([push(86), state(False)])
+    scan_until(h, lambda o: o and o[0].idle)
+    h.queue.extend([state(True), bytes.fromhex("130A010004070000000000000000000000000029"), push(85)])
+    out = scan_until(h, lambda o: o and o[0].battery == 85 and not o[0].idle)
+    assert out[0].battery == 85 and not out[0].idle
+
+
+def test_known_awake_state_overrides_the_one_hour_guess():
+    key = f"fa09:{hid_win.path_hash(f75_info().path)}"
+    compx.STORE_PATH.write_text('{"%s": [70, %f]}' % (key, time.time() - compx.IDLE_AFTER_S - 60))
+    h = FakeHandle()
+    assert scan_until(h, lambda o: bool(o))[0].idle
+    h.queue.append(state(True))
+    out = scan_until(h, lambda o: o and not o[0].idle)
+    assert out[0].battery == 70 and not out[0].idle
