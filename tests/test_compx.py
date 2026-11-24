@@ -303,3 +303,14 @@ def test_unwritable_store_does_not_break_reading(monkeypatch, tmp_path):
     monkeypatch.setattr(compx, "STORE_PATH", blocker / "sub" / "compx_last.json")
     out = scan_until(FakeHandle([push(61)]), lambda o: o and o[0].battery == 61)
     assert out[0].battery == 61
+
+
+def test_level_without_a_push_for_an_hour_is_shown_as_asleep():
+    key = f"fa09:{hid_win.path_hash(f75_info().path)}"
+    compx.STORE_PATH.write_text('{"%s": [70, %f]}' % (key, time.time() - compx.IDLE_AFTER_S - 60))
+    h = FakeHandle()
+    out = scan_until(h, lambda o: bool(o))
+    assert out[0].battery == 70 and out[0].idle
+    h.queue.append(push(69))
+    out = scan_until(h, lambda o: o and o[0].battery == 69)
+    assert not out[0].idle

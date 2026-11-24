@@ -49,6 +49,7 @@ REPORT_ID = 0x13
 POWER_HEADER = bytes((0x13, 0x0A, 0x01, 0x00, 0x04, 0x05))
 
 DEFAULT_NAME = "2.4 GHz keyboard"
+IDLE_AFTER_S = 3600.0       # no push for this long: show the level as asleep / last value
 REMEMBER_S = 24 * 3600.0    # a level saved by an earlier run is shown for at most this long
 STORE_NAME = "compx_last.json"
 STORE_PATH: Path | None = None  # tests override; default is the app data folder
@@ -298,6 +299,10 @@ def read(infos, deadline: float, cancel: threading.Event | None = None,
                 link="2.4ghz",
                 source="hid",
                 updated=lst.updated if pct is not None else None,
+                # The receiver cannot tell whether the keyboard is on; a level that has not
+                # changed for an hour is shown as asleep (last value) rather than live.
+                idle=pct is not None and lst.updated is not None
+                and time.time() - lst.updated > IDLE_AFTER_S,
             )
             nth = rank.get(dev.id, 0)
             rank[dev.id] = nth + 1
