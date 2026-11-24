@@ -1,5 +1,6 @@
-# Compx dongle probe for the AULA F75 (3554:FA09).
-# Read-only: it sends only the battery query (08 04 .. 49) and prints what the dongle answers.
+# Compx dongle probe for the AULA F75 (3554:FA09), version 2.
+# Read-only: it reads the receiver's status feature report (0x06) and listens to the 0x13 channel
+# while you press Fn+B and plug/unplug the keyboard's charging cable. It sends no commands.
 # Run:  powershell -NoProfile -ExecutionPolicy Bypass -File .\compx-probe.ps1
 # Close Taskbar Battery Widget first. Keep the keyboard in 2.4 GHz mode and press a key just before running.
 
@@ -30,7 +31,7 @@ public static class CompxProbe
     [DllImport("hid.dll")] static extern int HidP_GetCaps(IntPtr p, ref HIDP_CAPS c);
     [DllImport("hid.dll")] static extern int HidP_GetButtonCaps(int type, byte[] caps, ref ushort len, IntPtr p);
     [DllImport("hid.dll")] static extern int HidP_GetValueCaps(int type, byte[] caps, ref ushort len, IntPtr p);
-    [DllImport("hid.dll", SetLastError = true)] static extern bool HidD_SetOutputReport(SafeFileHandle h, byte[] b, int len);
+    [DllImport("hid.dll", SetLastError = true)] static extern bool HidD_GetFeature(SafeFileHandle h, byte[] b, int len);
     [DllImport("hid.dll", SetLastError = true)] static extern bool HidD_GetInputReport(SafeFileHandle h, byte[] b, int len);
     [DllImport("setupapi.dll")] static extern IntPtr SetupDiGetClassDevs(ref Guid g, IntPtr e, IntPtr w, uint f);
     [DllImport("setupapi.dll")] static extern bool SetupDiEnumDeviceInterfaces(IntPtr s, IntPtr d, ref Guid g, int i, ref SP_DEVICE_INTERFACE_DATA data);
@@ -70,11 +71,6 @@ public static class CompxProbe
         return s.Count == 0 ? "-" : string.Join(",", s.ToArray());
     }
 
-    static byte[] Request(int len)
-    {
-        byte[] r = new byte[len]; r[0] = 0x08; r[1] = 0x04; r[16] = 0x49; return r;
-    }
-
     public static string Run()
     {
         foreach (string path in Paths())
@@ -93,61 +89,63 @@ public static class CompxProbe
             }
             q.Dispose();
             W(string.Format("{0:X4}:{1:X4} page {2:X4} usage {3:X4} in {4} out {5} feat {6}{7}", a.Vid, a.Pid, c.UsagePage, c.Usage, c.InLen, c.OutLen, c.FeatLen, ids));
-            if (c.UsagePage < 0xFF00 || c.OutLen == 0 || c.InLen == 0) continue;
-            Probe(path, c.InLen, c.OutLen);
+            if (c.UsagePage == 0xFF04 && c.FeatLen > 0) Features(path, c.FeatLen);
+            if (c.UsagePage == 0xFF02 && c.InLen > 0) Listen(path, c.InLen);
         }
         return Log.ToString();
     }
 
-    static void Probe(string path, int inLen, int outLen)
+    static void Features(string path, int len)
     {
-        SafeFileHandle h = CreateFile(path, 0xC0000000, 3, IntPtr.Zero, 3, 0x40000000, IntPtr.Zero);
-        if (h.IsInvalid) { W("  open for read/write failed, error " + Marshal.GetLastWin32Error()); return; }
-        using (FileStream fs = new FileStream(h, FileAccess.ReadWrite, inLen, true))
+        SafeFileHandle h = CreateFile(path, 0, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+        if (h.IsInvalid) { W("  open failed, error " + Marshal.GetLastWin32Error()); return; }
+        for (int i = 0; i < 3; i++)
         {
-            List<string> heard = new List<string>();
-            object gate = new object();
-            DateTime end = DateTime.UtcNow.AddSeconds(4);
-            Thread reader = new Thread(delegate()
+            byte[] b = new byte[len]; b[0] = 0x06;
+            bool ok = HidD_GetFeature(h, b, b.Length);
+            W("  GetFeature(0x06) #" + (i + 1) + ": " + (ok ? Hex(b, b.Length) : "failed, error " + Marshal.GetLastWin32Error()));
+            Thread.Sleep(300);
+        }
+        h.Dispose();
+    }
+
+    public static int ListenSeconds = 25;
+
+    static void Listen(string path, int inLen)
+    {
+        SafeFileHandle h = CreateFile(path, 0x80000000, 3, IntPtr.Zero, 3, 0x40000000, IntPtr.Zero);
+        if (h.IsInvalid) { W("  open for reading failed, error " + Marshal.GetLastWin32Error()); return; }
+        byte[] gi = new byte[inLen]; gi[0] = 0x13;
+        bool gok = HidD_GetInputReport(h, gi, gi.Length);
+        W("  GetInputReport(0x13): " + (gok ? Hex(gi, gi.Length) : "failed, error " + Marshal.GetLastWin32Error()));
+        Console.WriteLine();
+        Console.WriteLine("  LISTENING " + ListenSeconds + "s: press Fn+B a few times, then plug in and unplug the keyboard's USB-C charging cable.");
+        using (FileStream fs = new FileStream(h, FileAccess.Read, inLen, true))
+        {
+            DateTime start = DateTime.UtcNow;
+            DateTime end = start.AddSeconds(ListenSeconds);
+            byte[] buf = new byte[inLen];
+            int count = 0;
+            while (DateTime.UtcNow < end)
             {
-                byte[] buf = new byte[inLen];
-                while (DateTime.UtcNow < end)
+                try
                 {
-                    try
-                    {
-                        Task<int> t = fs.ReadAsync(buf, 0, buf.Length);
-                        int ms = (int)Math.Max(1, (end - DateTime.UtcNow).TotalMilliseconds);
-                        if (!t.Wait(ms)) break;
-                        lock (gate) heard.Add(Hex(buf, t.Result));
-                    }
-                    catch (Exception ex) { lock (gate) heard.Add("read error: " + ex.GetBaseException().Message); break; }
+                    Task<int> t = fs.ReadAsync(buf, 0, buf.Length);
+                    int ms = (int)Math.Max(1, (end - DateTime.UtcNow).TotalMilliseconds);
+                    if (!t.Wait(ms)) break;
+                    count++;
+                    W(string.Format("    +{0:0.0}s {1}", (DateTime.UtcNow - start).TotalSeconds, Hex(buf, t.Result)));
                 }
-            });
-            reader.IsBackground = true; reader.Start();
-            Thread.Sleep(150);
-            byte[] req = Request(outLen);
-            try { fs.Write(req, 0, req.Length); fs.Flush(); W("  WriteFile " + Hex(req, req.Length) + ": ok"); }
-            catch (Exception ex) { W("  WriteFile failed: " + ex.GetBaseException().Message); }
-            Thread.Sleep(1200);
-            bool so = HidD_SetOutputReport(h, req, req.Length);
-            W("  HidD_SetOutputReport: " + (so ? "ok" : "failed, error " + Marshal.GetLastWin32Error()));
-            Thread.Sleep(1200);
-            byte[] gi = new byte[inLen]; gi[0] = 0x08;
-            bool gok = HidD_GetInputReport(h, gi, gi.Length);
-            W("  HidD_GetInputReport(0x08): " + (gok ? Hex(gi, gi.Length) : "failed, error " + Marshal.GetLastWin32Error()));
-            reader.Join(3000);
-            lock (gate)
-            {
-                W("  heard " + heard.Count + " input reports:");
-                foreach (string s in heard) W("    " + s);
+                catch (Exception ex) { W("    read error: " + ex.GetBaseException().Message); break; }
             }
+            W("  heard " + count + " reports on 0x13");
         }
     }
 }
 '@
 
 Add-Type -TypeDefinition $code
-Write-Host "Probing the Compx dongle. Press a key on the keyboard now, then wait about 10 seconds..." -ForegroundColor Cyan
+Write-Host "Probing the Compx dongle (read-only). Press a key on the keyboard now; follow the LISTENING prompt." -ForegroundColor Cyan
 Start-Sleep -Seconds 2
 $out = [CompxProbe]::Run()
 $file = Join-Path ([Environment]::GetFolderPath('Desktop')) 'compx-probe.txt'
