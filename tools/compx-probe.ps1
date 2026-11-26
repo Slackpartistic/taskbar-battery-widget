@@ -1,6 +1,8 @@
-# Compx dongle probe for the AULA F75 (3554:FA09), version 2.
-# Read-only: it reads the receiver's status feature report (0x06) and listens to the 0x13 channel
-# while you press Fn+B and plug/unplug the keyboard's charging cable. It sends no commands.
+# Compx 2.4 GHz receiver probe (3554:FA09: AULA, Redragon, MCHOSE, VXE ...), version 4.
+# It lists the receiver's HID collections, reads its status feature report (0x06), and listens to the
+# 0x13 channel. The only thing it ever sends is the battery query 13 4A 01 00 00 .. 00 5E (the read
+# that the official MCHOSE M HUB driver uses on this receiver), 4 times, 20 s apart. No settings,
+# lighting or firmware commands exist in this script.
 # Run:  powershell -NoProfile -ExecutionPolicy Bypass -File .\compx-probe.ps1
 # Close Taskbar Battery Widget first. Keep the keyboard in 2.4 GHz mode and press a key just before running.
 
@@ -38,6 +40,28 @@ public static class CompxProbe
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode)] static extern bool SetupDiGetDeviceInterfaceDetail(IntPtr s, ref SP_DEVICE_INTERFACE_DATA d, IntPtr detail, int size, out int req, IntPtr info);
     [DllImport("setupapi.dll")] static extern bool SetupDiDestroyDeviceInfoList(IntPtr s);
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern SafeFileHandle CreateFile(string n, uint a, uint s, IntPtr sa, uint c, uint f, IntPtr t);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool WriteFile(SafeFileHandle h, byte[] b, int n, out int written, IntPtr ovl);
+
+    // The one and only packet this probe can send: the battery query, padded to the report length.
+    static byte[] BatteryQuery(int len)
+    {
+        byte[] b = new byte[len];
+        b[0] = 0x13; b[1] = 0x4A; b[2] = 0x01;
+        b[len - 1] = 0x5E;   // sum of the bytes before it
+        return b;
+    }
+
+    static string Send(string path, int outLen)
+    {
+        SafeFileHandle w = CreateFile(path, 0x40000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+        if (w.IsInvalid) return "open for writing failed, error " + Marshal.GetLastWin32Error();
+        byte[] q = BatteryQuery(outLen);
+        int n = 0; int err = 0;
+        Task<bool> t = Task.Run(() => { bool ok = WriteFile(w, q, q.Length, out n, IntPtr.Zero); if (!ok) err = Marshal.GetLastWin32Error(); return ok; });
+        string r = !t.Wait(2000) ? "write timed out" : (t.Result ? "sent " + Hex(q, q.Length) : "write failed, error " + err);
+        w.Dispose();
+        return r;
+    }
 
     static readonly StringBuilder Log = new StringBuilder();
     static void W(string s) { Log.AppendLine(s); Console.WriteLine(s); }
@@ -90,7 +114,7 @@ public static class CompxProbe
             q.Dispose();
             W(string.Format("{0:X4}:{1:X4} page {2:X4} usage {3:X4} in {4} out {5} feat {6}{7}", a.Vid, a.Pid, c.UsagePage, c.Usage, c.InLen, c.OutLen, c.FeatLen, ids));
             if (c.UsagePage == 0xFF04 && c.FeatLen > 0) Features(path, c.FeatLen);
-            if (c.UsagePage == 0xFF02 && c.InLen > 0) Listen(path, c.InLen);
+            if (c.UsagePage == 0xFF02 && c.InLen > 0) Listen(path, c.InLen, c.OutLen);
         }
         return Log.ToString();
     }
@@ -109,9 +133,10 @@ public static class CompxProbe
         h.Dispose();
     }
 
-    public static int ListenSeconds = 180;
+    public static int ListenSeconds = 90;
+    static readonly int[] QueryAt = { 3, 23, 43, 63 };
 
-    static void Listen(string path, int inLen)
+    static void Listen(string path, int inLen, int outLen)
     {
         SafeFileHandle h = CreateFile(path, 0x80000000, 3, IntPtr.Zero, 3, 0x40000000, IntPtr.Zero);
         if (h.IsInvalid) { W("  open for reading failed, error " + Marshal.GetLastWin32Error()); return; }
@@ -119,22 +144,33 @@ public static class CompxProbe
         bool gok = HidD_GetInputReport(h, gi, gi.Length);
         W("  GetInputReport(0x13): " + (gok ? Hex(gi, gi.Length) : "failed, error " + Marshal.GetLastWin32Error()));
         Console.WriteLine();
-        Console.WriteLine("  LISTENING " + ListenSeconds + "s. 1) Do not touch the keyboard for 90 s (let it sleep). 2) Press one key to wake it. 3) Switch the keyboard OFF, wait 10 s, switch it back ON.");
+        Console.WriteLine("  LISTENING " + ListenSeconds + "s. Keep typing now and then so the keyboard stays awake.");
+        Console.WriteLine("  Around the middle, plug the charging cable in, wait 5 s, unplug it.");
         using (FileStream fs = new FileStream(h, FileAccess.Read, inLen, true))
         {
             DateTime start = DateTime.UtcNow;
             DateTime end = start.AddSeconds(ListenSeconds);
             byte[] buf = new byte[inLen];
-            int count = 0;
+            int count = 0, next = 0;
+            Task<int> t = null;
             while (DateTime.UtcNow < end)
             {
+                double now = (DateTime.UtcNow - start).TotalSeconds;
+                if (next < QueryAt.Length && now >= QueryAt[next])
+                {
+                    W(string.Format("    +{0:0.0}s query #{1}: {2}", now, next + 1, outLen >= 20 ? Send(path, outLen) : "not sent (output report too short)"));
+                    next++;
+                }
                 try
                 {
-                    Task<int> t = fs.ReadAsync(buf, 0, buf.Length);
-                    int ms = (int)Math.Max(1, (end - DateTime.UtcNow).TotalMilliseconds);
-                    if (!t.Wait(ms)) break;
+                    if (t == null) t = fs.ReadAsync(buf, 0, buf.Length);
+                    DateTime until = next < QueryAt.Length ? start.AddSeconds(QueryAt[next]) : end;
+                    if (until > end) until = end;
+                    int ms = (int)Math.Max(1, (until - DateTime.UtcNow).TotalMilliseconds);
+                    if (!t.Wait(ms)) continue;
                     count++;
                     W(string.Format("    +{0:0.0}s {1}", (DateTime.UtcNow - start).TotalSeconds, Hex(buf, t.Result)));
+                    t = null;
                 }
                 catch (Exception ex) { W("    read error: " + ex.GetBaseException().Message); break; }
             }
@@ -145,7 +181,7 @@ public static class CompxProbe
 '@
 
 Add-Type -TypeDefinition $code
-Write-Host "Probing the Compx dongle (read-only). Press a key on the keyboard now; follow the LISTENING prompt." -ForegroundColor Cyan
+Write-Host "Probing the Compx dongle. It only sends the battery query 13 4A. Press a key on the keyboard now; follow the LISTENING prompt." -ForegroundColor Cyan
 Start-Sleep -Seconds 2
 $out = [CompxProbe]::Run()
 $file = Join-Path ([Environment]::GetFolderPath('Desktop')) 'compx-probe.txt'
